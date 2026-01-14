@@ -52,11 +52,33 @@ class ProtocolTest {
     @Test
     void hintSerialization() {
         String message = "reduce";
-        Protocol.HintData hint = new Protocol.HintData(Protocol.HintData.FLAG_THROTTLE_COSMETICS, 1024, message);
+        Protocol.HintData hint = new Protocol.HintData(Protocol.HintData.FLAG_THROTTLE_COSMETICS, 42, 1024, message);
         Protocol.HintData copy = Protocol.HintData.fromBytes(hint.toBytes());
         assertNotNull(copy);
         assertEquals(hint.flags(), copy.flags());
+        assertEquals(hint.id(), copy.id());
         assertEquals(hint.bandwidthBudget(), copy.bandwidthBudget());
         assertEquals(hint.message(), copy.message());
+    }
+
+    @Test
+    void checksumValidation() {
+        UUID token = UUID.randomUUID();
+        byte[] encoded = Protocol.encode(Protocol.PacketType.PING, token, new byte[]{1, 2, 3, 4});
+        encoded[encoded.length - 1] ^= 0x01;
+        assertNull(Protocol.decode(encoded));
+    }
+
+    @Test
+    void compressionRoundTrip() {
+        UUID token = UUID.randomUUID();
+        byte[] payload = new byte[2048];
+        for (int i = 0; i < payload.length; i++) {
+            payload[i] = (byte) (i % 8);
+        }
+        byte[] encoded = Protocol.encode(Protocol.PacketType.COSMETIC, token, payload, 8192, 256);
+        Protocol.Packet packet = Protocol.decode(encoded, 8192);
+        assertNotNull(packet);
+        assertArrayEquals(payload, packet.payload());
     }
 }

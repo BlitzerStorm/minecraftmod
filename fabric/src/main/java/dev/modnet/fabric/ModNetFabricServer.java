@@ -1,12 +1,14 @@
 package dev.modnet.fabric;
 
 import com.mojang.brigadier.CommandDispatcher;
+import dev.modnet.common.LogLevel;
 import dev.modnet.common.Protocol;
 import dev.modnet.common.UdpServer;
 import io.netty.buffer.Unpooled;
 import net.fabricmc.api.DedicatedServerModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.PacketSender;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.command.CommandRegistryAccess;
@@ -18,10 +20,6 @@ import net.minecraft.server.network.ServerPlayNetworkHandler;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
-import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.entity.player.PlayerEvent;
-import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.entity.player.PlayerEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,24 +36,26 @@ public final class ModNetFabricServer implements DedicatedServerModInitializer {
     private final ConcurrentHashMap<UUID, Protocol.TelemetryData> telemetryStats = new ConcurrentHashMap<>();
     private UdpServer udpServer;
     private ModNetConfig config;
+    private int udpPort;
 
     @Override
     public void onInitializeServer() {
         config = ModNetConfig.load();
         if (config.isUdpEnabled()) {
             try {
-                udpServer = new UdpServer(config.getUdpPort(), LOGGER::info);
+                udpServer = new UdpServer(config.resolveUdpPort(), message -> log(message, LogLevel.INFO), config.serverConfig());
+                udpPort = udpServer.getPort();
                 udpServer.setTelemetryListener(this::handleTelemetry);
                 udpServer.setCosmeticListener((token, data) -> {
                 });
-                udpServer.setHintListener((token, hint) -> LOGGER.info("Received hint from {}: {}", token, hint.message()));
+                udpServer.setHintListener((token, hint) -> log("Received hint from " + token + ": " + hint.message(), LogLevel.INFO));
             } catch (SocketException e) {
                 LOGGER.error("Failed to start ModNet UDP server", e);
             }
         }
-        MinecraftForge.EVENT_BUS.addListener(this::handleLogout);
 
         ServerPlayNetworking.registerGlobalReceiver(CHANNEL, this::handleClientHello);
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> handleLogout(handler.player));
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> close());
         CommandRegistrationCallback.EVENT.register(this::registerCommands);
     }
@@ -73,7 +73,8 @@ public final class ModNetFabricServer implements DedicatedServerModInitializer {
             udpServer.register(token);
         }
         PacketByteBuf response = new PacketByteBuf(Unpooled.buffer());
-        response.writeBytes(Protocol.writeServerHello(token, config.isUdpEnabled() ? config.getUdpPort() : 0));
+        int port = udpServer != null ? udpPort : 0;
+        response.writeBytes(Protocol.writeServerHello(token, port));
         ServerPlayNetworking.send(player, CHANNEL, response);
     }
 
@@ -81,10 +82,7 @@ public final class ModNetFabricServer implements DedicatedServerModInitializer {
         telemetryStats.put(token, data);
     }
 
-    private void handleLogout(PlayerEvent.PlayerLoggedOutEvent event) {
-        if (!(event.getPlayer() instanceof ServerPlayerEntity player)) {
-            return;
-        }
+    private void handleLogout(ServerPlayerEntity player) {
         tokenToPlayer.entrySet().removeIf(entry -> {
             if (!entry.getValue().getUUID().equals(player.getUUID())) {
                 return false;
@@ -101,6 +99,7 @@ public final class ModNetFabricServer implements DedicatedServerModInitializer {
         if (udpServer != null) {
             udpServer.close();
             udpServer = null;
+            udpPort = 0;
         }
     }
 
@@ -114,6 +113,28 @@ public final class ModNetFabricServer implements DedicatedServerModInitializer {
     private String buildStats() {
         int playerCount = tokenToPlayer.size();
         double avgLoss = telemetryStats.values().stream().mapToInt(Protocol.TelemetryData::packetLoss).average().orElse(0.0);
-        return "ModNet UDP stats: players=" + playerCount + ", avgLoss=" + String.format("%.2f", avgLoss) + "%";
+        if (udpServer == null) {
+            return "ModNet UDP stats: disabled";
+        }
+        UdpServer.Stats stats = udpServer.stats();
+        return "ModNet UDP stats: players=" + playerCount
+                + ", avgLoss=" + String.format("%.2f", avgLoss) + "%"
+                + ", packetsRx=" + stats.packetsReceived()
+                + ", packetsTx=" + stats.packetsSent()
+                + ", drops=" + stats.packetsDropped()
+                + ", invalid=" + stats.invalidPackets();
+    }
+
+    private void log(String message, LogLevel level) {
+        if (config != null && !config.getLogLevel().allows(level)) {
+            return;
+        }
+        if (level == LogLevel.ERROR) {
+            LOGGER.error(message);
+        } else if (level == LogLevel.WARN) {
+            LOGGER.warn(message);
+        } else {
+            LOGGER.info(message);
+        }
     }
 }

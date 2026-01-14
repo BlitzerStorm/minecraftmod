@@ -1,12 +1,13 @@
 package dev.modnet.forge;
 
+import dev.modnet.common.LogLevel;
 import dev.modnet.common.Protocol;
 import dev.modnet.common.UdpClient;
 import io.netty.buffer.Unpooled;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.Connection;
 import net.minecraft.network.FriendlyByteBuf;
-import net.minecraft.network.protocol.game.ServerboundCustomPayloadPacket;
+import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.ClientCustomPayloadEvent;
@@ -19,20 +20,24 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Logger;
 
 @Mod.EventBusSubscriber(modid = ModNetForge.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public final class ModNetForgeClient {
     private static final ResourceLocation CHANNEL = new ResourceLocation("modnet", "main");
+    private static final Logger LOGGER = Logger.getLogger("modnet");
     private static UdpClient udpClient;
     private static UUID currentToken = UUID.randomUUID();
     private static final AtomicInteger cosmeticCounter = new AtomicInteger();
     private static long lastFrameTime = System.nanoTime();
+    private static ModNetForgeConfig config;
 
     private ModNetForgeClient() {
     }
 
     @SubscribeEvent
     public static void onClientLogin(ClientPlayerNetworkEvent.LoggingIn event) {
+        config = ModNetForgeConfig.load();
         currentToken = UUID.randomUUID();
         sendHello(event.getConnection());
     }
@@ -68,7 +73,8 @@ public final class ModNetForgeClient {
             return;
         }
         int tick = cosmeticCounter.incrementAndGet();
-        if (tick % 5 == 0) {
+        int rateLimit = config != null ? Math.max(1, config.getCosmeticRateLimitTicks()) : 5;
+        if (tick % rateLimit == 0) {
             sendCosmetic(client);
         }
     }
@@ -90,8 +96,8 @@ public final class ModNetForgeClient {
             return;
         }
         try {
-            udpClient = new UdpClient(address, hello.token(), ModNetForgeClient::handleHint, message -> {
-            });
+            UdpClient.Config clientConfig = config != null ? config.clientConfig() : UdpClient.Config.defaults();
+            udpClient = new UdpClient(address, hello.token(), ModNetForgeClient::handleHint, message -> log(message, LogLevel.INFO), clientConfig);
             udpClient.setTelemetrySupplier(ModNetForgeClient::createTelemetry);
             udpClient.start();
         } catch (Exception e) {
@@ -136,7 +142,7 @@ public final class ModNetForgeClient {
 
     private static void handleHint(Protocol.HintData hint) {
         if ((hint.flags() & Protocol.HintData.FLAG_THROTTLE_COSMETICS) != 0) {
-            // log or throttle cosmetic frequency
+            log("Server requested cosmetic throttle: " + hint.message(), LogLevel.INFO);
         }
     }
 
@@ -155,6 +161,19 @@ public final class ModNetForgeClient {
         if (udpClient != null) {
             udpClient.close();
             udpClient = null;
+        }
+    }
+
+    private static void log(String message, LogLevel level) {
+        if (config != null && !config.getLogLevel().allows(level)) {
+            return;
+        }
+        if (level == LogLevel.ERROR) {
+            LOGGER.severe(message);
+        } else if (level == LogLevel.WARN) {
+            LOGGER.warning(message);
+        } else {
+            LOGGER.info(message);
         }
     }
 }

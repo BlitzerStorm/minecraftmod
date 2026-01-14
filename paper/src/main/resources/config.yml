@@ -1,2 +1,15 @@
 udp-enabled: true
 udp-port: 25566
+udp-port-min: 25566
+udp-port-max: 25566
+udp-max-payload-bytes: 8192
+udp-compression-threshold-bytes: 512
+udp-rate-limit-per-second: 100
+udp-rate-limit-burst: 200
+udp-session-timeout-seconds: 90
+udp-hint-retry-count: 3
+udp-hint-retry-interval-millis: 750
+udp-socket-timeout-millis: 1000
+udp-fallback-timeout-millis: 5000
+cosmetic-rate-limit-ticks: 5
+log-level: info

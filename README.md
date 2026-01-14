@@ -1,69 +1,82 @@
-# ModNet
+# ModNet (Minecraft 1.21.8)
 
-ModNet is a lightweight networking companion for Minecraft 1.21.8 that keeps the gameplay-critical TCP
-channel intact while opening an optional UDP side channel for telemetry, cosmetics, and adaptive hints.
+ModNet is a cross-platform Minecraft **1.21.8** mod/plugin that opens an **optional UDP side-channel**
+alongside the standard TCP plugin channel (`modnet:main`). Only non-critical traffic goes over UDP:
+telemetry (client performance stats), cosmetics (particles/capes/nametags), and adaptive hints from
+the server (e.g., “reduce cosmetic rate”). Gameplay-critical packets remain on TCP.
+
+## How it works
+
+1. Client sends `ClientHello` on `modnet:main`.
+2. Server replies with `ServerHello` containing the UDP port and token.
+3. Client starts UDP and sends telemetry/cosmetics; server sends hints back.
+4. UDP payloads are length-prefixed, versioned, checksum-validated, and optionally compressed.
+5. Hint packets are retried with acknowledgements (simple reliability layer).
+
+## Modules
 
 | Module | Role |
 | --- | --- |
-| `common` | Shared protocol, telemetry/cosmetic serializers, and UDP client/server primitives. |
-| `fabric` | Fabric client/server adapters that reuse the shared protocol. |
-| `forge` | Forge client/server adapters that speak the same plugin channel. |
-| `paper` | Paper plugin that authenticates tokens and exposes `/modnet stats`. |
+| `common` | Protocol, UDP client/server, retries, rate limiting, tests. |
+| `fabric` | Fabric client + dedicated server adapters (Yarn mappings). |
+| `forge` | Forge/NeoForge adapters using Mojang official mappings. |
+| `paper` | Paper plugin with `/modnet stats` command. |
 
-## Protocol highlights
-
-- Header: `magic (MODN) + version (1) + type (byte) + length (short) + token (UUID) + payload`.
-- Payloads: `TELEMETRY`, `COSMETIC`, and `HINT` (plus ping/pong). Each payload type is extensible,
-  so future additions (voice, predictive compression hints, etc.) plug in cleanly.
-- Handshake: all implementations speak the `modnet:main` plugin channel. Clients send `ClientHello`
-  (random UUID); servers reply with `ServerHello` (UDP port + token). UDP packets must echo the token.
-- Security: tokens expire on disconnect, UDP listeners validate tokens and rate-limit implicitly by
-  checking caches before responding.
-- Fallback: lack of UDP pongs or servers returning port `0` causes clients to keep using TCP.
-
-## Building & testing
-
-1. Install Java 17 and run `./gradlew` from the project root.
-2. Build whichever module you need:
+## Build (Java 17)
 
 ```bash
-./gradlew :common:build   # includes unit tests for Protocol serialization
+./gradlew :common:build
 ./gradlew :fabric:build
 ./gradlew :forge:build
 ./gradlew :paper:build
 ```
 
-3. Run the `common` unit tests separately: `./gradlew :common:test`.
+## Configure
 
-## Configuration & deployment
+### Fabric/Forge (`config/modnet.properties`)
+```
+udp.enabled=true
+udp.port=25566
+udp.portMin=25566
+udp.portMax=25566
+udp.maxPayloadBytes=8192
+udp.compressionThresholdBytes=512
+udp.rateLimitPerSecond=100
+udp.rateLimitBurst=200
+udp.sessionTimeoutSeconds=90
+udp.hintRetryCount=3
+udp.hintRetryIntervalMillis=750
+udp.socketTimeoutMillis=1000
+udp.fallbackTimeoutMillis=5000
+cosmetic.rateLimitTicks=5
+log.level=info
+```
 
-- **Fabric/Forge**: `config/modnet.properties` (generated from `modnet-default.properties` in resources).
-  - `udp.enabled` toggles the UDP listener.
-  - `udp.port` controls the UDP socket that clients connect to.
-- **Paper**: `plugins/ModNet/config.yml` (values `udp-enabled` and `udp-port`).
+### Paper (`plugins/ModNet/config.yml`)
+```yaml
+udp-enabled: true
+udp-port: 25566
+udp-port-min: 25566
+udp-port-max: 25566
+udp-max-payload-bytes: 8192
+udp-compression-threshold-bytes: 512
+udp-rate-limit-per-second: 100
+udp-rate-limit-burst: 200
+udp-session-timeout-seconds: 90
+udp-hint-retry-count: 3
+udp-hint-retry-interval-millis: 750
+udp-socket-timeout-millis: 1000
+udp-fallback-timeout-millis: 5000
+cosmetic-rate-limit-ticks: 5
+log-level: info
+```
 
-Clients automatically detect UDP availability at login; if UDP pings fail after 5 seconds or the
-server reports `udp-port: 0`, the mod quietly keeps using TCP.
+## Runtime commands
 
-## Runtime behavior
+`/modnet stats` — shows active UDP users and packet counts (received/sent/dropped/invalid).
 
-- Clients emit telemetry every second and cosmetic updates every few ticks via the shared `UdpClient`.
-- Servers track telemetry per token and send hints (e.g., throttle cosmetics) whenever bandwidth drops
-  below a threshold or packet loss spikes.
-- All servers register `/modnet stats`, which reports the number of UDP-using players and their average loss.
-- The Paper plugin keeps `token -> player` maps and exposes the UDP listener for vanilla/Ktor proxies.
-- The shared `UdpServer` class can be re-used in proxies (Velocity/Bungee) by wiring its token cache to
-  plugin messages.
+## Troubleshooting
 
-## Testing recommendations
-
-1. Launch a Paper server with `plugins/ModNet` and start a Fabric/Forge client with the ModNet mod.
-2. Use Wireshark (filter `udp.port == 25566`) to confirm telemetry (`modnet:main` handshake + UDP payloads).
-3. Trigger `/modnet stats` on the server to ensure telemetry is aggregated; the message should display
-   how many clients are on UDP and their average packet loss.
-
-## Next steps
-
-1. Extend `Protocol.PacketType` for richer hints (bandwidth budgets, predictive compression metadata, etc.).
-2. Connect the server hint listener to your TPS/congestion profiler and send stronger hints for proxies.
-3. Instrument `/modnet stats` data for Grafana/Prometheus exports if you care about internet resilience.
+* **No UDP traffic**: ensure `udp.enabled` is true and UDP port is open.
+* **Fallback to TCP**: clients log UDP fallback after no PONGs within `udp.fallbackTimeoutMillis`.
+* **Drops increasing**: raise `udp.rateLimitPerSecond` or `udp.maxPayloadBytes` as needed.

@@ -1,22 +1,33 @@
 package dev.modnet.common;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.zip.CRC32;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * Shared binary protocol that carries UDP packets between the ModNet client and server.
  * <p>
  * Header layout:
  * <pre>
- * [magic 4 bytes][version 1][type 1][length 2][token 16][payload length bytes]
+ * [magic 4 bytes][version 1][type 1][flags 1][length 2][token 16][checksum 4][payload length bytes]
  * </pre>
  */
 public final class Protocol {
     public static final int MAGIC = 0x4d4f444e; // 'MODN'
     public static final byte VERSION = 1;
     public static final String CHANNEL = "modnet:main";
+    public static final int HEADER_SIZE = 4 + 1 + 1 + 1 + 2 + 16 + 4;
+    public static final int DEFAULT_MAX_PAYLOAD = 8192;
+    public static final int DEFAULT_COMPRESSION_THRESHOLD = 512;
+
+    public static final byte FLAG_COMPRESSED = 0x1;
 
     private Protocol() {
     }
@@ -26,7 +37,8 @@ public final class Protocol {
         PONG((byte) 1),
         TELEMETRY((byte) 2),
         COSMETIC((byte) 3),
-        HINT((byte) 4);
+        HINT((byte) 4),
+        HINT_ACK((byte) 5);
 
         private final byte id;
 
@@ -49,26 +61,54 @@ public final class Protocol {
     }
 
     public static byte[] encode(PacketType type, UUID token, byte[] payload) {
+        return encode(type, token, payload, DEFAULT_MAX_PAYLOAD, DEFAULT_COMPRESSION_THRESHOLD);
+    }
+
+    public static byte[] encode(PacketType type, UUID token, byte[] payload, int maxPayload, int compressionThreshold) {
         Objects.requireNonNull(type, "type");
         Objects.requireNonNull(token, "token");
         payload = payload == null ? new byte[0] : payload;
-        if (payload.length > Short.MAX_VALUE) {
+        if (payload.length > maxPayload) {
             throw new IllegalArgumentException("Payload too large: " + payload.length);
         }
 
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 1 + 1 + 2 + 16 + payload.length);
+        byte flags = 0;
+        byte[] encodedPayload = payload;
+        if (compressionThreshold > 0 && payload.length >= compressionThreshold) {
+            byte[] compressed = gzip(payload);
+            if (compressed != null && compressed.length < payload.length) {
+                flags |= FLAG_COMPRESSED;
+                encodedPayload = compressed;
+            }
+        }
+
+        if (encodedPayload.length > maxPayload) {
+            throw new IllegalArgumentException("Payload too large after compression: " + encodedPayload.length);
+        }
+        if (encodedPayload.length > 0xFFFF) {
+            throw new IllegalArgumentException("Payload exceeds protocol length limits: " + encodedPayload.length);
+        }
+
+        int checksum = checksum(encodedPayload);
+        ByteBuffer buffer = ByteBuffer.allocate(HEADER_SIZE + encodedPayload.length);
         buffer.putInt(MAGIC);
         buffer.put(VERSION);
         buffer.put(type.id);
-        buffer.putShort((short) payload.length);
+        buffer.put(flags);
+        buffer.putShort((short) encodedPayload.length);
         buffer.putLong(token.getMostSignificantBits());
         buffer.putLong(token.getLeastSignificantBits());
-        buffer.put(payload);
+        buffer.putInt(checksum);
+        buffer.put(encodedPayload);
         return buffer.array();
     }
 
     public static Packet decode(byte[] data) {
-        if (data == null || data.length < 4 + 1 + 1 + 2 + 16) {
+        return decode(data, DEFAULT_MAX_PAYLOAD);
+    }
+
+    public static Packet decode(byte[] data, int maxPayload) {
+        if (data == null || data.length < HEADER_SIZE) {
             return null;
         }
         ByteBuffer buffer = ByteBuffer.wrap(data);
@@ -83,13 +123,31 @@ public final class Protocol {
         if (type == null) {
             return null;
         }
+        byte flags = buffer.get();
         int length = Short.toUnsignedInt(buffer.getShort());
-        if (buffer.remaining() < 16 + length) {
+        if (length > maxPayload) {
+            return null;
+        }
+        if (buffer.remaining() < 16 + 4 + length) {
             return null;
         }
         UUID token = new UUID(buffer.getLong(), buffer.getLong());
+        int checksum = buffer.getInt();
         byte[] payload = new byte[length];
         buffer.get(payload);
+        if (checksum(payload) != checksum) {
+            return null;
+        }
+        if ((flags & FLAG_COMPRESSED) != 0) {
+            byte[] inflated = gunzip(payload);
+            if (inflated == null) {
+                return null;
+            }
+            if (inflated.length > maxPayload) {
+                return null;
+            }
+            payload = inflated;
+        }
         return new Packet(type, token, payload);
     }
 
@@ -97,27 +155,32 @@ public final class Protocol {
     }
 
     public static byte[] writeClientHello(UUID token) {
-        ByteBuffer buffer = ByteBuffer.allocate(1 + 16);
+        ByteBuffer buffer = ByteBuffer.allocate(1 + 1 + 16);
         buffer.put((byte) 1);
+        buffer.put(VERSION);
         buffer.putLong(token.getMostSignificantBits());
         buffer.putLong(token.getLeastSignificantBits());
         return buffer.array();
     }
 
     public static ClientHello readClientHello(byte[] data) {
-        if (data == null || data.length != 1 + 16) {
+        if (data == null || data.length != 1 + 1 + 16) {
             return null;
         }
         ByteBuffer buffer = ByteBuffer.wrap(data);
         if (buffer.get() != 1) {
             return null;
         }
+        if (buffer.get() != VERSION) {
+            return null;
+        }
         return new ClientHello(new UUID(buffer.getLong(), buffer.getLong()));
     }
 
     public static byte[] writeServerHello(UUID token, int udpPort) {
-        ByteBuffer buffer = ByteBuffer.allocate(1 + 16 + 4);
+        ByteBuffer buffer = ByteBuffer.allocate(1 + 1 + 16 + 4);
         buffer.put((byte) 2);
+        buffer.put(VERSION);
         buffer.putLong(token.getMostSignificantBits());
         buffer.putLong(token.getLeastSignificantBits());
         buffer.putInt(udpPort);
@@ -125,11 +188,14 @@ public final class Protocol {
     }
 
     public static ServerHello readServerHello(byte[] data) {
-        if (data == null || data.length != 1 + 16 + 4) {
+        if (data == null || data.length != 1 + 1 + 16 + 4) {
             return null;
         }
         ByteBuffer buffer = ByteBuffer.wrap(data);
         if (buffer.get() != 2) {
+            return null;
+        }
+        if (buffer.get() != VERSION) {
             return null;
         }
         UUID token = new UUID(buffer.getLong(), buffer.getLong());
@@ -141,6 +207,51 @@ public final class Protocol {
     }
 
     public record ServerHello(UUID token, int udpPort) {
+    }
+
+    public static byte[] writeHintAck(int hintId) {
+        ByteBuffer buffer = ByteBuffer.allocate(4);
+        buffer.putInt(hintId);
+        return buffer.array();
+    }
+
+    public static Integer readHintAck(byte[] payload) {
+        if (payload == null || payload.length != 4) {
+            return null;
+        }
+        return ByteBuffer.wrap(payload).getInt();
+    }
+
+    private static int checksum(byte[] payload) {
+        CRC32 crc32 = new CRC32();
+        crc32.update(payload);
+        return (int) crc32.getValue();
+    }
+
+    private static byte[] gzip(byte[] payload) {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream();
+             GZIPOutputStream gzip = new GZIPOutputStream(out)) {
+            gzip.write(payload);
+            gzip.finish();
+            return out.toByteArray();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static byte[] gunzip(byte[] payload) {
+        try (ByteArrayInputStream in = new ByteArrayInputStream(payload);
+             GZIPInputStream gzip = new GZIPInputStream(in);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[512];
+            int read;
+            while ((read = gzip.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
+            return out.toByteArray();
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     public static final class TelemetryData {
@@ -307,6 +418,7 @@ public final class Protocol {
 
     public static final class HintData {
         private final byte flags;
+        private final int id;
         private final int bandwidthBudget;
         private final String message;
 
@@ -314,15 +426,21 @@ public final class Protocol {
         public static final byte FLAG_REQUEST_COMPRESSION = 0x2;
 
         public HintData(byte flags, int bandwidthBudget, String message) {
+            this(flags, 0, bandwidthBudget, message);
+        }
+
+        public HintData(byte flags, int id, int bandwidthBudget, String message) {
             this.flags = flags;
+            this.id = id;
             this.bandwidthBudget = bandwidthBudget;
             this.message = message != null ? message : "";
         }
 
         public byte[] toBytes() {
             byte[] messageBytes = message.getBytes(StandardCharsets.UTF_8);
-            ByteBuffer buffer = ByteBuffer.allocate(1 + Integer.BYTES + 2 + messageBytes.length);
+            ByteBuffer buffer = ByteBuffer.allocate(1 + Integer.BYTES + Integer.BYTES + 2 + messageBytes.length);
             buffer.put(flags);
+            buffer.putInt(id);
             buffer.putInt(bandwidthBudget);
             buffer.putShort((short) messageBytes.length);
             buffer.put(messageBytes);
@@ -330,11 +448,12 @@ public final class Protocol {
         }
 
         public static HintData fromBytes(byte[] bytes) {
-            if (bytes == null || bytes.length < 1 + Integer.BYTES + 2) {
+            if (bytes == null || bytes.length < 1 + Integer.BYTES + Integer.BYTES + 2) {
                 return null;
             }
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
             byte flags = buffer.get();
+            int id = buffer.getInt();
             int budget = buffer.getInt();
             int length = Short.toUnsignedInt(buffer.getShort());
             if (buffer.remaining() < length) {
@@ -343,11 +462,15 @@ public final class Protocol {
             byte[] messageBytes = new byte[length];
             buffer.get(messageBytes);
             String message = new String(messageBytes, StandardCharsets.UTF_8);
-            return new HintData(flags, budget, message);
+            return new HintData(flags, id, budget, message);
         }
 
         public byte flags() {
             return flags;
+        }
+
+        public int id() {
+            return id;
         }
 
         public int bandwidthBudget() {
