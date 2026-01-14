@@ -6,6 +6,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -19,6 +20,12 @@ import java.util.function.Supplier;
 
 /** UDP client for ModNet that sends telemetry/cosmetics/hints over fire-and-forget packets. */
 public final class UdpClient implements Closeable {
+    public record Config(int maxPayloadBytes, int compressionThresholdBytes, int socketTimeoutMillis, int fallbackTimeoutMillis) {
+        public static Config defaults() {
+            return new Config(Protocol.DEFAULT_MAX_PAYLOAD, Protocol.DEFAULT_COMPRESSION_THRESHOLD, 1000, 5000);
+        }
+    }
+
     private final DatagramSocket socket;
     private final InetSocketAddress server;
     private final UUID token;
@@ -26,13 +33,22 @@ public final class UdpClient implements Closeable {
     private final Consumer<Protocol.HintData> hintHandler;
     private final ScheduledExecutorService scheduler;
     private final ExecutorService receiver;
+    private final Config config;
     private final AtomicLong lastPong = new AtomicLong(System.currentTimeMillis());
     private final AtomicBoolean fallback = new AtomicBoolean(false);
+    private final AtomicLong packetsSent = new AtomicLong();
+    private final AtomicLong packetsReceived = new AtomicLong();
+    private final AtomicLong packetsDropped = new AtomicLong();
 
     private volatile boolean running;
     private volatile Supplier<Protocol.TelemetryData> telemetrySupplier;
 
     public UdpClient(InetSocketAddress server, UUID token, Consumer<Protocol.HintData> hintHandler, Consumer<String> log)
+            throws SocketException {
+        this(server, token, hintHandler, log, Config.defaults());
+    }
+
+    public UdpClient(InetSocketAddress server, UUID token, Consumer<Protocol.HintData> hintHandler, Consumer<String> log, Config config)
             throws SocketException {
         this.server = Objects.requireNonNull(server, "server");
         this.token = Objects.requireNonNull(token, "token");
@@ -40,8 +56,9 @@ public final class UdpClient implements Closeable {
         } : hintHandler;
         this.log = log == null ? message -> {
         } : log;
+        this.config = config == null ? Config.defaults() : config;
         this.socket = new DatagramSocket();
-        this.socket.setSoTimeout(1000);
+        this.socket.setSoTimeout(this.config.socketTimeoutMillis());
         this.scheduler = Executors.newScheduledThreadPool(3, runnable -> {
             Thread thread = new Thread(runnable, "modnet-udp-client-sched");
             thread.setDaemon(true);
@@ -108,17 +125,26 @@ public final class UdpClient implements Closeable {
     }
 
     private void sendPacket(Protocol.PacketType type, byte[] payload) {
-        byte[] encoded = Protocol.encode(type, token, payload);
+        byte[] encoded;
+        try {
+            encoded = Protocol.encode(type, token, payload, config.maxPayloadBytes(), config.compressionThresholdBytes());
+        } catch (IllegalArgumentException e) {
+            packetsDropped.incrementAndGet();
+            log.accept("Unable to encode UDP packet: " + e.getMessage());
+            return;
+        }
         DatagramPacket packet = new DatagramPacket(encoded, encoded.length, server);
         try {
             socket.send(packet);
+            packetsSent.incrementAndGet();
         } catch (IOException e) {
+            packetsDropped.incrementAndGet();
             log.accept("Unable to send UDP packet: " + e.getMessage());
         }
     }
 
     private void receiveLoop() {
-        byte[] buffer = new byte[1024];
+        byte[] buffer = new byte[Math.max(Protocol.DEFAULT_MAX_PAYLOAD, config.maxPayloadBytes()) + Protocol.HEADER_SIZE];
         DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
 
         while (running && !socket.isClosed()) {
@@ -126,13 +152,15 @@ public final class UdpClient implements Closeable {
                 socket.receive(packet);
                 byte[] data = new byte[packet.getLength()];
                 System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
-                Protocol.Packet parsed = Protocol.decode(data);
+                Protocol.Packet parsed = Protocol.decode(data, config.maxPayloadBytes());
                 if (parsed == null) {
+                    packetsDropped.incrementAndGet();
                     continue;
                 }
+                packetsReceived.incrementAndGet();
                 handlePacket(parsed);
             } catch (IOException e) {
-                if (running) {
+                if (running && !(e instanceof SocketTimeoutException)) {
                     log.accept("UDP receive failed: " + e.getMessage());
                 }
             }
@@ -155,12 +183,13 @@ public final class UdpClient implements Closeable {
             Protocol.HintData hint = Protocol.HintData.fromBytes(packet.payload());
             if (hint != null) {
                 hintHandler.accept(hint);
+                sendPacket(Protocol.PacketType.HINT_ACK, Protocol.writeHintAck(hint.id()));
             }
         }
     }
 
     private void checkFallback() {
-        if (System.currentTimeMillis() - lastPong.get() > 5000 && !fallback.get()) {
+        if (System.currentTimeMillis() - lastPong.get() > config.fallbackTimeoutMillis() && !fallback.get()) {
             fallback.set(true);
             log.accept("UDP fallback triggered (no pong).");
         }
@@ -172,5 +201,17 @@ public final class UdpClient implements Closeable {
         socket.close();
         scheduler.shutdownNow();
         receiver.shutdownNow();
+    }
+
+    public long getPacketsSent() {
+        return packetsSent.get();
+    }
+
+    public long getPacketsReceived() {
+        return packetsReceived.get();
+    }
+
+    public long getPacketsDropped() {
+        return packetsDropped.get();
     }
 }

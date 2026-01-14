@@ -6,14 +6,14 @@
   "description": "Client mod that negotiates a UDP side-channel with a Paper plugin.",
   "authors": ["you"],
   "license": "MIT",
-  "environment": "client",
+  "environment": "*",
   "entrypoints": {
     "client": ["dev.modnet.fabric.ModNetFabricClient"],
     "main": ["dev.modnet.fabric.ModNetFabricServer"]
   },
   "depends": {
     "fabricloader": ">=${fabric_loader_version}",
-    "minecraft": ">=${minecraft_version}",
+    "minecraft": "${minecraft_version}",
     "fabric-api": "*"
   }
 }

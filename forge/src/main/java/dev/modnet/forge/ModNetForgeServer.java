@@ -1,14 +1,15 @@
 package dev.modnet.forge;
 
+import dev.modnet.common.LogLevel;
 import dev.modnet.common.Protocol;
 import dev.modnet.common.UdpServer;
 import io.netty.buffer.Unpooled;
 import net.minecraft.network.FriendlyByteBuf;
-import net.minecraft.network.protocol.game.ClientboundCustomPayloadPacket;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.resources.ResourceLocation;
-import net.minecraft.server.commands.CommandManager;
-import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.text.Text;
+import net.minecraft.commands.Commands;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.network.ServerCustomPayloadEvent;
@@ -28,10 +29,11 @@ public final class ModNetForgeServer {
     private static final Logger LOGGER = Logger.getLogger("modnet");
     private static final ResourceLocation CHANNEL = new ResourceLocation("modnet", "main");
 
-    private static final ConcurrentHashMap<UUID, ServerPlayerEntity> tokenToPlayer = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, ServerPlayer> tokenToPlayer = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<UUID, Protocol.TelemetryData> telemetryStats = new ConcurrentHashMap<>();
     private static UdpServer udpServer;
     private static ModNetForgeConfig config;
+    private static int udpPort;
 
     private ModNetForgeServer() {
     }
@@ -46,11 +48,12 @@ public final class ModNetForgeServer {
             return;
         }
         try {
-            udpServer = new UdpServer(config.getUdpPort(), LOGGER::info);
+            udpServer = new UdpServer(config.resolveUdpPort(), message -> log(message, LogLevel.INFO), config.serverConfig());
+            udpPort = udpServer.getPort();
             udpServer.setTelemetryListener((token, data) -> telemetryStats.put(token, data));
             udpServer.setCosmeticListener((token, data) -> {
             });
-            udpServer.setHintListener((token, hint) -> LOGGER.info("Received client hint: " + hint.message()));
+            udpServer.setHintListener((token, hint) -> log("Received client hint: " + hint.message(), LogLevel.INFO));
         } catch (SocketException e) {
             LOGGER.warning("Unable to start ModNet UDP server: " + e.getMessage());
         }
@@ -64,6 +67,7 @@ public final class ModNetForgeServer {
         }
         tokenToPlayer.clear();
         telemetryStats.clear();
+        udpPort = 0;
     }
 
     @SubscribeEvent
@@ -79,7 +83,7 @@ public final class ModNetForgeServer {
             return;
         }
         UUID token = hello.token();
-        ServerPlayerEntity player = event.getSource().getPlayer();
+        ServerPlayer player = event.getSource().getPlayer();
         if (player == null) {
             return;
         }
@@ -88,15 +92,15 @@ public final class ModNetForgeServer {
             udpServer.register(token);
         }
         FriendlyByteBuf response = new FriendlyByteBuf(Unpooled.buffer());
-        int port = udpServer != null ? config.getUdpPort() : 0;
+        int port = udpServer != null ? udpPort : 0;
         response.writeBytes(Protocol.writeServerHello(token, port));
         player.connection.send(new ClientboundCustomPayloadPacket(CHANNEL, response));
     }
 
     @SubscribeEvent
     public static void onRegisterCommands(RegisterCommandsEvent event) {
-        event.getDispatcher().register(CommandManager.literal("modnet").then(CommandManager.literal("stats").executes(context -> {
-            context.getSource().sendSuccess(Text.literal(buildStats()), false);
+        event.getDispatcher().register(Commands.literal("modnet").then(Commands.literal("stats").executes(context -> {
+            context.getSource().sendSuccess(Component.literal(buildStats()), false);
             return 1;
         })));
     }
@@ -104,12 +108,21 @@ public final class ModNetForgeServer {
     private static String buildStats() {
         int players = tokenToPlayer.size();
         double avgLoss = telemetryStats.values().stream().mapToInt(Protocol.TelemetryData::packetLoss).average().orElse(0);
-        return "ModNet UDP stats: players=" + players + ", avg loss=" + String.format("%.2f", avgLoss) + "%";
+        if (udpServer == null) {
+            return "ModNet UDP stats: disabled";
+        }
+        UdpServer.Stats stats = udpServer.stats();
+        return "ModNet UDP stats: players=" + players
+                + ", avgLoss=" + String.format("%.2f", avgLoss) + "%"
+                + ", packetsRx=" + stats.packetsReceived()
+                + ", packetsTx=" + stats.packetsSent()
+                + ", drops=" + stats.packetsDropped()
+                + ", invalid=" + stats.invalidPackets();
     }
 
     @SubscribeEvent
     public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
-        if (!(event.getPlayer() instanceof ServerPlayerEntity player)) {
+        if (!(event.getPlayer() instanceof ServerPlayer player)) {
             return;
         }
         UUID token = tokenToPlayer.entrySet().stream()
@@ -123,6 +136,19 @@ public final class ModNetForgeServer {
                 udpServer.unregister(token);
             }
             telemetryStats.remove(token);
+        }
+    }
+
+    private static void log(String message, LogLevel level) {
+        if (config != null && !config.getLogLevel().allows(level)) {
+            return;
+        }
+        if (level == LogLevel.ERROR) {
+            LOGGER.severe(message);
+        } else if (level == LogLevel.WARN) {
+            LOGGER.warning(message);
+        } else {
+            LOGGER.info(message);
         }
     }
 }

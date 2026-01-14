@@ -2,6 +2,7 @@ package dev.modnet.fabric;
 
 import dev.modnet.common.Protocol;
 import dev.modnet.common.UdpClient;
+import dev.modnet.common.LogLevel;
 import io.netty.buffer.Unpooled;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -13,7 +14,6 @@ import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.network.PacketByteBuf;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Vec3d;
-import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,9 +31,11 @@ public final class ModNetFabricClient implements ClientModInitializer {
     private volatile UUID currentToken = UUID.randomUUID();
     private final AtomicInteger cosmeticTick = new AtomicInteger();
     private volatile long lastFrameTime = System.nanoTime();
+    private ModNetConfig config;
 
     @Override
     public void onInitializeClient() {
+        config = ModNetConfig.load();
         ClientPlayNetworking.registerGlobalReceiver(CHANNEL, this::handleServerHello);
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> sendHello());
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> stopUdp());
@@ -45,7 +47,8 @@ public final class ModNetFabricClient implements ClientModInitializer {
             return;
         }
         int tick = cosmeticTick.incrementAndGet();
-        if (tick % 5 == 0) {
+        int rateLimit = config != null ? Math.max(1, config.getCosmeticRateLimitTicks()) : 5;
+        if (tick % rateLimit == 0) {
             sendCosmetic(client);
         }
     }
@@ -76,10 +79,11 @@ public final class ModNetFabricClient implements ClientModInitializer {
             return;
         }
         try {
-            udpClient = new UdpClient(address, token, this::handleHint, LOGGER::info);
+            UdpClient.Config clientConfig = config != null ? config.clientConfig() : UdpClient.Config.defaults();
+            udpClient = new UdpClient(address, token, this::handleHint, message -> log(message, LogLevel.INFO), clientConfig);
             udpClient.setTelemetrySupplier(this::createTelemetry);
             udpClient.start();
-            LOGGER.info("Started UDP client at {}", address);
+            log("Started UDP client at " + address, LogLevel.INFO);
         } catch (Exception e) {
             LOGGER.error("Failed to start UDP client", e);
         }
@@ -123,7 +127,7 @@ public final class ModNetFabricClient implements ClientModInitializer {
 
     private void handleHint(Protocol.HintData hint) {
         if ((hint.flags() & Protocol.HintData.FLAG_THROTTLE_COSMETICS) != 0) {
-            LOGGER.info("Server requested cosmetic throttle: {}", hint.message());
+            log("Server requested cosmetic throttle: " + hint.message(), LogLevel.INFO);
         }
     }
 
@@ -143,6 +147,19 @@ public final class ModNetFabricClient implements ClientModInitializer {
         if (udpClient != null) {
             udpClient.close();
             udpClient = null;
+        }
+    }
+
+    private void log(String message, LogLevel level) {
+        if (config != null && !config.getLogLevel().allows(level)) {
+            return;
+        }
+        if (level == LogLevel.ERROR) {
+            LOGGER.error(message);
+        } else if (level == LogLevel.WARN) {
+            LOGGER.warn(message);
+        } else {
+            LOGGER.info(message);
         }
     }
 }
