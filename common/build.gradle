@@ -1,0 +1,21 @@
+plugins {
+    id 'java-library'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(java_version as int)
+    }
+}
+
+dependencies {
+    api 'org.slf4j:slf4j-api:2.0.7'
+    compileOnly 'org.projectlombok:lombok:1.18.32'
+    annotationProcessor 'org.projectlombok:lombok:1.18.32'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.0'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}

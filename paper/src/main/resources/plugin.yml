@@ -1,0 +1,9 @@
+name: ModNet
+version: ${version}
+main: dev.modnet.paper.ModNetPlugin
+api-version: 1.21
+author: you
+commands:
+  modnet:
+    description: Shows ModNet UDP statistics.
+    usage: /modnet stats

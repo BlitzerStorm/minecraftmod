@@ -1,0 +1,19 @@
+modLoader="javafml"
+loaderVersion="[52,)"
+license="MIT"
+
+[[mods]]
+modId="modnet"
+version="${version}"
+displayName="ModNet"
+description='''ModNet introduces an optional UDP side-channel to offload telemetry/cosmetics from TCP for Fabric/Forge clients and servers.'''
+authors="you"
+credits=""
+logoFile=""
+
+[[dependencies.modnet]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,)"
+ordering="NONE"
+side="BOTH"

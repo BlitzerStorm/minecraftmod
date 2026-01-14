@@ -1,0 +1,38 @@
+plugins {
+    id 'net.minecraftforge.gradle' version '6.0.24'
+}
+
+base {
+    archivesName = 'modnet-forge'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(java_version as int)
+    }
+}
+
+minecraft {
+    mappings channel: 'official', version: minecraft_version
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${forge_version}"
+    implementation project(':common')
+}
+
+processResources {
+    inputs.property 'version', project.version
+    inputs.property 'minecraft_version', minecraft_version
+
+    filesMatching('META-INF/mods.toml') {
+        expand(
+            version: project.version,
+            minecraft_version: minecraft_version
+        )
+    }
+}
+
+jar {
+    from project(':common').sourceSets.main.output
+}
